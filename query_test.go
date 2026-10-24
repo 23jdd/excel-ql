@@ -195,9 +195,8 @@ func TestHeaderAndSheetValidation(t *testing.T) {
 		message string
 	}{
 		{"empty", nil, "empty worksheet"},
-		{"blank header", [][]any{{"id", nil}, {"x", "y"}}, "empty header"},
 		{"duplicate", [][]any{{"id", " id "}}, "duplicate"},
-		{"extra data", [][]any{{"id"}, {"x", "extra"}}, "empty header"},
+		{"unnamed headers", [][]any{{nil, " \t"}, {"x", "extra"}}, "missing header"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -86,7 +86,8 @@ func (eq *ExcelQuery) read(sheet, alias string) (table, error) {
 	}
 	var ws struct {
 		Rows []struct {
-			Cells []sourceCell `xml:"c"`
+			Number int          `xml:"r,attr"`
+			Cells  []sourceCell `xml:"c"`
 		} `xml:"sheetData>row"`
 		Merges []struct {
 			Ref string `xml:"ref,attr"`
@@ -112,8 +113,77 @@ func (eq *ExcelQuery) read(sheet, alias string) (table, error) {
 		}
 		merges = append(merges, rect{x1, y1, x2, y2})
 	}
-	values := make(map[int]map[int]string)
-	width := 0
+	readValue := func(cell sourceCell, x, y int) (string, error) {
+		for _, m := range merges {
+			if x >= m.x1 && x <= m.x2 && y >= m.y1 && y <= m.y2 && (x != m.x1 || y != m.y1) {
+				return "", nil
+			}
+		}
+		if cell.Formula != nil && cell.Value == nil {
+			return "", fmt.Errorf("row %d cell %s: formula has no cached result", y, cell.Ref)
+		}
+		if cell.Type == "e" {
+			return "", fmt.Errorf("row %d cell %s: Excel error value", y, cell.Ref)
+		}
+		value, err := eq.f.GetCellValue(sheet, cell.Ref, excelize.Options{RawCellValue: true})
+		if err != nil {
+			return "", fmt.Errorf("row %d cell %s: %w", y, cell.Ref, err)
+		}
+		return value, nil
+	}
+
+	// Discover the schema before reading data. Empty headers do not define columns.
+	headers := make(map[int]string)
+	for _, row := range ws.Rows {
+		if row.Number != 0 && row.Number != 1 {
+			continue
+		}
+		for _, cell := range row.Cells {
+			if cell.Value == nil && cell.Inline == nil {
+				continue
+			}
+			x, y, err := excelize.CellNameToCoordinates(cell.Ref)
+			if err != nil {
+				return table{}, err
+			}
+			if y != 1 {
+				continue
+			}
+			value, err := readValue(cell, x, y)
+			if err != nil {
+				return table{}, err
+			}
+			if name := strings.TrimSpace(value); name != "" {
+				headers[x] = name
+			}
+		}
+	}
+	if len(headers) == 0 {
+		return table{}, fmt.Errorf("empty worksheet: missing header row with named columns")
+	}
+	columns := make([]int, 0, len(headers))
+	for column := range headers {
+		columns = append(columns, column)
+	}
+	sort.Ints(columns)
+	t := table{columns: make([]string, len(columns))}
+	if alias != "" {
+		t.aliases = []string{alias}
+	}
+	positions := make(map[int]int, len(columns))
+	for i, column := range columns {
+		name := headers[column]
+		if alias != "" {
+			name = alias + "." + name
+		}
+		t.columns[i] = name
+		positions[column] = i
+	}
+	if err := uniqueNames(t.columns); err != nil {
+		return table{}, fmt.Errorf("row 1: %w", err)
+	}
+
+	values := make(map[int][]any)
 	for _, row := range ws.Rows {
 		for _, cell := range row.Cells {
 			if cell.Value == nil && cell.Inline == nil && cell.Formula == nil {
@@ -123,70 +193,30 @@ func (eq *ExcelQuery) read(sheet, alias string) (table, error) {
 			if err != nil {
 				return table{}, err
 			}
-			covered := false
-			for _, m := range merges {
-				if x >= m.x1 && x <= m.x2 && y >= m.y1 && y <= m.y2 && (x != m.x1 || y != m.y1) {
-					covered = true
-					break
-				}
-			}
-			if covered {
+			position, named := positions[x]
+			if y <= 1 || !named {
 				continue
 			}
-			if cell.Formula != nil && cell.Value == nil {
-				return table{}, fmt.Errorf("row %d cell %s: formula has no cached result", y, cell.Ref)
-			}
-			if cell.Type == "e" {
-				return table{}, fmt.Errorf("row %d cell %s: Excel error value", y, cell.Ref)
-			}
-			value, err := eq.f.GetCellValue(sheet, cell.Ref, excelize.Options{RawCellValue: true})
+			value, err := readValue(cell, x, y)
 			if err != nil {
-				return table{}, fmt.Errorf("row %d cell %s: %w", y, cell.Ref, err)
+				return table{}, err
 			}
 			if value == "" {
 				continue
 			}
 			if values[y] == nil {
-				values[y] = make(map[int]string)
+				values[y] = make([]any, len(columns))
 			}
-			values[y][x] = value
-			if x > width {
-				width = x
-			}
+			values[y][position] = value
 		}
-	}
-	if width == 0 {
-		return table{}, fmt.Errorf("empty worksheet: missing header row")
-	}
-	t := table{columns: make([]string, width)}
-	if alias != "" {
-		t.aliases = []string{alias}
-	}
-	for i := range t.columns {
-		name := strings.TrimSpace(values[1][i+1])
-		if name == "" {
-			return table{}, fmt.Errorf("row 1 column %d: empty header", i+1)
-		}
-		if alias != "" {
-			name = alias + "." + name
-		}
-		t.columns[i] = name
-	}
-	if err := uniqueNames(t.columns); err != nil {
-		return table{}, fmt.Errorf("row 1: %w", err)
 	}
 	indices := make([]int, 0, len(values))
 	for y := range values {
-		if y > 1 {
-			indices = append(indices, y)
-		}
+		indices = append(indices, y)
 	}
 	sort.Ints(indices)
 	for _, y := range indices {
-		row := Row{Columns: t.columns, Values: make([]any, width)}
-		for x, value := range values[y] {
-			row.Values[x-1] = value
-		}
+		row := Row{Columns: t.columns, Values: values[y]}
 		t.rows = append(t.rows, record{row: row, origin: fmt.Sprintf("sheet %q row %d", sheet, y)})
 	}
 	return t, nil
